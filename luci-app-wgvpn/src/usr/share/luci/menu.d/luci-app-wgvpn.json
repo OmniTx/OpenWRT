@@ -1,0 +1,15 @@
+{
+    "admin/services/wgvpn": {
+        "title": "WireGuard VPN",
+        "order": 55,
+        "action": {
+            "type": "view",
+            "path": "wgvpn"
+        },
+        "depends": {
+            "acl": [
+                "luci-app-wgvpn"
+            ]
+        }
+    }
+}

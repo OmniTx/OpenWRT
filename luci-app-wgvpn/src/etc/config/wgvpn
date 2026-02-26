@@ -1,0 +1,12 @@
+config global 'global'
+	option interface 'wg_vpn'
+	option table '100'
+	option mode 'selective'
+	option block_ipv6 '0'
+	option lan_bridge 'br-vpn_lan'
+	option vpn_dns '10.2.0.1'
+
+config rule 'example'
+	option name 'My PC'
+	option subnet '192.168.15.50'
+	option enabled '0'

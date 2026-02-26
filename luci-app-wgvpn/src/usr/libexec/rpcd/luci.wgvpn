@@ -1,0 +1,154 @@
+#!/bin/sh
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+_status() {
+    local iface table wgout hs tf ep rules
+    config_load wgvpn
+    config_get iface  global interface 'wg_vpn'
+    config_get table  global table     '100'
+
+    wgout=$(wg show "$iface" 2>/dev/null)
+
+    hs=$(echo "$wgout"    | awk '/latest handshake/{$1=$2=""; gsub(/^[ \t]+/,""); print}')
+    tf=$(echo "$wgout"    | awk '/transfer:/{$1=""; gsub(/^[ \t]+/,""); print}')
+    ep=$(echo "$wgout"    | awk '/endpoint:/{print $NF}')
+    rules=$(ip rule list 2>/dev/null | grep -c "lookup $table" || echo 0)
+
+    [ -z "$hs" ] && hs="No handshake"
+    [ -z "$tf" ] && tf="No transfer"
+    [ -z "$ep" ] && ep="Not configured"
+
+    json_init
+    json_add_string "handshake" "$hs"
+    json_add_string "transfer"  "$tf"
+    json_add_int    "rules"     "$rules"
+    json_add_string "endpoint"  "$ep"
+    json_add_string "interface" "$iface"
+    json_dump
+}
+
+_apply() {
+    config_load wgvpn
+
+    local iface table dns_ip mode block_ipv6 lan_bridge
+    config_get iface      global interface  'wg_vpn'
+    config_get table      global table      '100'
+    config_get dns_ip     global vpn_dns    ''
+    config_get mode       global mode       'selective'
+    config_get block_ipv6 global block_ipv6 '0'
+    config_get lan_bridge global lan_bridge 'br-lan'
+
+    case "$iface" in
+        lan|wan|lo|br-lan|eth0)
+            echo '{"result":"error","message":"Refusing to apply rules to unsafe interface"}'
+            return 1
+            ;;
+    esac
+
+    # 1. Clean up old policy rules (idempotent)
+    ip rule list 2>/dev/null | grep "lookup $table" | awk -F: '{print $1}' | while read p; do
+        ip rule del prio "$p" 2>/dev/null
+    done
+    ip rule del prio 50 2>/dev/null
+
+    # 2. Add router local-traffic bypass
+    # Ensures the router itself (SSH, dnsmasq upstream) always uses ISP, not VPN
+    ip rule add from all iif lo lookup main priority 50 2>/dev/null
+
+    # 3. Build VPN routing table with a Kill Switch Floor
+    ip route flush table "$table" 2>/dev/null
+    
+    # BLACKHOLE: This metric 65535 route is always present.
+    # If the VPN drops, traffic falls into the blackhole instead of leaking to ISP
+    ip route add blackhole default table "$table" metric 65535 2>/dev/null
+    
+    if [ -n "$dns_ip" ]; then
+        ip route add "$dns_ip/32" dev "$iface" table "$table" 2>/dev/null
+    fi
+    
+    # Active VPN route at metric 100 (beats the blackhole when iface is UP)
+    ip route add default dev "$iface" table "$table" metric 100 onlink 2>/dev/null
+    ip route flush cache
+
+    # 4. Firewall (nftables / fw4 native)
+    # Clean up any old rules injected by this app
+    for chain in forward input srcnat; do
+        nft -a list chain inet fw4 $chain 2>/dev/null | awk '/wgvpn-app/{print $NF}' | while read h; do
+            nft delete rule inet fw4 $chain handle "$h" 2>/dev/null || true
+        done
+    done
+
+    # Inject MASQUERADE and FORWARD rules for the VPN tunnel
+    nft insert rule inet fw4 srcnat oifname "$iface" masquerade comment "wgvpn-app" 2>/dev/null
+    nft insert rule inet fw4 forward oifname "$iface" accept comment "wgvpn-app" 2>/dev/null
+    nft insert rule inet fw4 forward iifname "$iface" accept comment "wgvpn-app" 2>/dev/null
+
+    # 5. Apply Policy Routing Rules
+    if [ "$mode" = "all" ]; then
+        # ALL CONNECTED DEVICES MODE
+        ip route show table main | awk '/scope link/{print $1}' | while read subnet; do
+            ip rule add from "$subnet" lookup "$table" priority 100 2>/dev/null
+        done
+        
+        # Block global IPv6 on the specified bridge to prevent leaks
+        if [ "$block_ipv6" = "1" ] && [ -n "$lan_bridge" ]; then
+            nft insert rule inet fw4 forward iifname "$lan_bridge" meta nfproto ipv6 ip6 daddr 2000::/3 drop comment "wgvpn-app" 2>/dev/null
+            nft insert rule inet fw4 input iifname "$lan_bridge" meta nfproto ipv6 ip6 daddr 2000::/3 drop comment "wgvpn-app" 2>/dev/null
+        fi
+    else
+        # SELECTIVE MODE (Specific IPs/Subnets)
+        local _pf
+        _pf=$(mktemp /tmp/wgvpn.XXXXXX)
+        echo 100 > "$_pf"
+        
+        apply_rule() {
+            local cfg="$1" enabled subnet prio mac
+            config_get enabled "$cfg" enabled '0'
+            config_get subnet  "$cfg" subnet  ''
+            
+            [ "$enabled" = "1" ] && [ -n "$subnet" ] && {
+                prio=$(cat "$_pf")
+                ip rule add from "$subnet" lookup "$table" priority "$prio" 2>/dev/null
+                echo $((prio + 1)) > "$_pf"
+                
+                # Advanced IPv6 leak block: Target specific MAC addresses if it's a single IP
+                if [ "$block_ipv6" = "1" ]; then
+                    # Force ping to update ARP cache
+                    ping -c 1 -W 1 "${subnet%/*}" >/dev/null 2>&1
+                    mac=$(ip neigh show "${subnet%/*}" | grep -v FAILED | awk '{print $5}' | head -n1)
+                    if [ -n "$mac" ]; then
+                        nft insert rule inet fw4 forward ether saddr "$mac" meta nfproto ipv6 drop comment "wgvpn-app" 2>/dev/null
+                        nft insert rule inet fw4 input ether saddr "$mac" meta nfproto ipv6 drop comment "wgvpn-app" 2>/dev/null
+                    fi
+                fi
+            }
+        }
+        config_foreach apply_rule rule
+        rm -f "$_pf"
+    fi
+
+    # 6. Persistence (Hotplug)
+    # Ensures the VPN routing survives when the WireGuard interface reconnects
+    mkdir -p /etc/hotplug.d/iface
+    cat > /etc/hotplug.d/iface/99-wgvpn << HOTPLUG
+#!/bin/sh
+[ "\$INTERFACE" = "$iface" ] && [ "\$ACTION" = "ifup" ] && {
+    logger -t wgvpn "Restoring VPN routes for \$INTERFACE"
+    ubus call luci.wgvpn apply
+}
+HOTPLUG
+    chmod +x /etc/hotplug.d/iface/99-wgvpn
+
+    logger -t wgvpn "Applied: mode=$mode iface=$iface table=$table"
+    echo '{"result":"ok"}'
+}
+
+case "$1" in
+    list) echo '{"status":{},"apply":{}}' ;;
+    call)
+        case "$2" in
+            status) _status ;;
+            apply)  _apply  ;;
+        esac ;;
+esac

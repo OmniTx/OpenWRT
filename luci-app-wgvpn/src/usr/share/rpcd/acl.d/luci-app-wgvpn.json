@@ -1,0 +1,27 @@
+{
+    "luci-app-wgvpn": {
+        "description": "WireGuard VPN Manager",
+        "read": {
+            "ubus": {
+                "luci.wgvpn": [
+                    "status",
+                    "apply"
+                ]
+            },
+            "uci": [
+                "wgvpn"
+            ]
+        },
+        "write": {
+            "ubus": {
+                "luci.wgvpn": [
+                    "status",
+                    "apply"
+                ]
+            },
+            "uci": [
+                "wgvpn"
+            ]
+        }
+    }
+}
