@@ -10,7 +10,7 @@ This repository is organized into the following sections:
   - Contains exported UCI states, custom shell scripts, and specific network setups (e.g., ProtonVPN WireGuard isolated LAN script).
   - *Note: Sensitive variables such as private keys and passwords have been redacted. Check for `.example` files (like `vpn-secrets.conf.example`) to see what information you need to provide to use these scripts.*
   
-- **`apps/`** *(Coming Soon)*
+- **`apps/`**
   - OpenWrt packages, compiled binaries, or custom scripts for apps running on the router.
 
 - **`guides/`** *(Coming Soon)*
