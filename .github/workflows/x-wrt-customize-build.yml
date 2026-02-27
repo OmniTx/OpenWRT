@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       xwrt_tag:
-        description: 'X-WRT release tag from github.com/x-wrt/build-release/releases (include the v prefix)'
+        description: 'X-WRT source tag from github.com/x-wrt/x-wrt/tags (WITHOUT v prefix, e.g. 23.10_b202312150123)'
         required: true
-        default: 'v26.04_b202602280042'
+        default: '23.10_b202312150123'
 
 permissions:
   contents: write
@@ -14,114 +14,123 @@ jobs:
   build:
     name: Compile Firmware
     runs-on: ubuntu-latest
+    timeout-minutes: 300
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Free up disk space
+        run: |
+          echo "Before cleanup:"
+          df -h .
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
+            /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker rmi $(docker image ls -aq) 2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          echo "After cleanup:"
+          df -h .
+
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
-            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget xsltproc \
+            python3-dev python3-distutils
 
-      - name: Download X-WRT ImageBuilder from GitHub Release
+      - name: Clone x-wrt source
         run: |
           TAG="${{ github.event.inputs.xwrt_tag }}"
+          echo "Building X-WRT tag: ${TAG}"
 
-          echo "Fetching release asset list for tag ${TAG}..."
+          git clone https://github.com/x-wrt/x-wrt.git xwrt-source
+          cd xwrt-source
 
-          # Use GitHub API to list all assets for this release
-          ASSETS=$(curl -sL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/x-wrt/build-release/releases/tags/${TAG}")
-
-          # x-wrt releases bundle everything in zip files per target/device.
-          # The ImageBuilder .tar.xz is INSIDE the zip, not a standalone asset.
-          #
-          # New releases (v26+): per-device zips like x-wrt-ramips-mt7621-apps.zip
-          #   The "-apps.zip" contains the ImageBuilder + packages
-          # Old releases (v23): per-target zips like x-wrt-23.10_b...-ramips-mt7621.zip
-          #   The full target zip contains everything including ImageBuilder
-          ASSET_URL=$(echo "$ASSETS" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          assets = data.get('assets', [])
-
-          # Priority 1: look for ramips-mt7621 apps zip (new format, smaller, has ImageBuilder)
-          for a in assets:
-              name = a['name'].lower()
-              if 'ramips-mt7621' in name and 'apps' in name and name.endswith('.zip'):
-                  print(a['browser_download_url'])
-                  sys.exit(0)
-
-          # Priority 2: look for ramips-mt7621 target zip (old format, large but has everything)
-          #   Exclude ext4fs and nosymbol variants
-          for a in assets:
-              name = a['name'].lower()
-              if 'ramips-mt7621' in name and name.endswith('.zip'):
-                  if 'ext4fs' not in name and 'nosymbol' not in name:
-                      print(a['browser_download_url'])
-                      sys.exit(0)
-
-          # Priority 3: any ramips-mt7621 zip at all
-          for a in assets:
-              name = a['name'].lower()
-              if 'ramips-mt7621' in name and name.endswith('.zip'):
-                  print(a['browser_download_url'])
-                  sys.exit(0)
-          ")
-
-          if [ -z "$ASSET_URL" ]; then
-            echo "ERROR: Could not find ramips-mt7621 zip in release ${TAG}"
-            echo "Available ramips assets:"
-            echo "$ASSETS" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          for a in data.get('assets', []):
-              if 'ramips' in a['name'].lower():
-                  print('  ', a['name'])
-          " || echo "  (no ramips assets found)"
-            echo ""
-            echo "All assets:"
-            echo "$ASSETS" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          for a in data.get('assets', []):
-              print('  ', a['name'])
-          " | head -30
-            echo "Check release at: https://github.com/x-wrt/build-release/releases/tag/${TAG}"
-            exit 1
+          # Checkout the specified tag
+          if [ "${TAG}" != "master" ]; then
+            git checkout "${TAG}" 2>/dev/null || {
+              echo "Tag ${TAG} not found, trying with v prefix..."
+              git checkout "v${TAG}" 2>/dev/null || {
+                echo "ERROR: Could not find tag ${TAG} or v${TAG}"
+                echo "Available tags:"
+                git tag -l | grep -i "$(echo ${TAG} | cut -d_ -f1)" | tail -20
+                exit 1
+              }
+            }
           fi
 
-          echo "Found target zip: $ASSET_URL"
-          wget "$ASSET_URL" -O target.zip
+          echo "✓ X-WRT source at: $(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
 
-          echo "Extracting zip..."
-          mkdir -p /tmp/xwrt-extract
-          unzip -q target.zip -d /tmp/xwrt-extract
+      - name: Update feeds
+        run: |
+          cd xwrt-source
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "✓ Feeds updated and installed"
 
-          echo "Looking for ImageBuilder tarball inside zip..."
-          IB_TAR=$(find /tmp/xwrt-extract -name "*imagebuilder*ramips*mt7621*.tar.xz" -o -name "*imagebuilder*.tar.xz" 2>/dev/null | head -n1)
+      - name: Configure build
+        run: |
+          TAG="${{ github.event.inputs.xwrt_tag }}"
+          cd xwrt-source
 
-          if [ -z "$IB_TAR" ]; then
-            echo "Contents of extracted zip:"
-            find /tmp/xwrt-extract -type f | head -50
-            echo ""
-            echo "ERROR: No ImageBuilder tarball found inside the zip"
-            echo "This release may not include an ImageBuilder for ramips-mt7621"
-            exit 1
-          fi
+          # Generate config for Xiaomi Mi Router 4A Gigabit (ramips/mt7621)
+          cat > .config << 'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_xiaomi_mi-router-4a-gigabit=y
 
-          echo "Found ImageBuilder tarball: $IB_TAR"
-          tar -Jxf "$IB_TAR"
-          mv x-wrt-imagebuilder-* imagebuilder 2>/dev/null || \
-            mv *imagebuilder* imagebuilder 2>/dev/null
-          echo "✓ ImageBuilder ready"
-          ls -la imagebuilder/
+          # LuCI web interface
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
 
-      - name: Verify custom files exist in repo
+          # PPPoE
+          CONFIG_PACKAGE_ppp=y
+          CONFIG_PACKAGE_ppp-mod-pppoe=y
+
+          # WireGuard VPN
+          CONFIG_PACKAGE_luci-proto-wireguard=y
+          CONFIG_PACKAGE_kmod-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+
+          # ZeroTier
+          CONFIG_PACKAGE_zerotier=y
+          CONFIG_PACKAGE_luci-app-zerotier=y
+
+          # Wake on LAN
+          CONFIG_PACKAGE_luci-app-wol=y
+          CONFIG_PACKAGE_etherwake=y
+
+          # Proxy tools
+          CONFIG_PACKAGE_redsocks=y
+          CONFIG_PACKAGE_dns2socks=y
+
+          # X-WRT specific apps
+          CONFIG_PACKAGE_luci-app-commands=y
+          CONFIG_PACKAGE_luci-app-xwan=y
+          CONFIG_PACKAGE_luci-app-natflow-users=y
+
+          # Network performance
+          CONFIG_PACKAGE_kmod-nft-nat=y
+          CONFIG_PACKAGE_kmod-nft-offload=y
+          CONFIG_PACKAGE_kmod-nf-conntrack=y
+
+          # WiFi (prefer wolfssl)
+          CONFIG_PACKAGE_wpad-basic-wolfssl=y
+          # CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+          EOF
+
+          # Set version string
+          echo "CONFIG_VERSION_NUMBER=\"${TAG}\"" >> .config
+
+          make defconfig
+          echo "✓ Build configured"
+          echo "Target: $(grep CONFIG_TARGET_BOARD .config | head -1)"
+          echo "Profile: $(grep CONFIG_TARGET_.*_DEVICE_ .config | grep '=y' | head -1)"
+
+      - name: Verify custom files exist
         run: |
           [ -f "my-configs/x-wrt-customize/banner" ] || {
             echo "ERROR: my-configs/x-wrt-customize/banner not found"
@@ -131,75 +140,11 @@ jobs:
             echo "ERROR: my-configs/x-wrt-customize/luci-banner.js not found"
             exit 1
           }
-          echo "✓ banner found"
-          echo "✓ luci-banner.js found"
+          echo "✓ Custom files verified"
 
-      - name: Fetch X-WRT luci.js and append banner injection
+      - name: Stage custom banner
         run: |
           TAG="${{ github.event.inputs.xwrt_tag }}"
-
-          # luci-base ipk is in the ImageBuilder's packages directory
-          # which was extracted in the previous step — no network fetch needed
-          LUCI_IPK=$(find imagebuilder/packages -name "luci-base*.ipk" 2>/dev/null | head -n1)
-
-          if [ -n "$LUCI_IPK" ]; then
-            echo "Found luci-base ipk: $LUCI_IPK"
-            mkdir -p /tmp/luci-extract
-            cd /tmp/luci-extract
-            tar -xzf "$LUCI_IPK"
-            tar -xzf data.tar.gz ./www/luci-static/resources/luci.js 2>/dev/null || \
-              tar -xzf data.tar.gz
-            cd -
-            LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
-          fi
-
-          if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
-            echo "WARNING: Could not find luci-base ipk in ImageBuilder packages"
-            echo "Trying package index feed..."
-
-            # Fallback: fetch from X-WRT package feed via GitHub release assets
-            # The packages feed URL is embedded in the ImageBuilder's repositories.conf
-            REPO_URL=$(grep "x-wrt\|xwrt" imagebuilder/repositories.conf 2>/dev/null \
-              | grep "^src/gz" | awk '{print $3}' | head -n1)
-
-            if [ -n "$REPO_URL" ]; then
-              wget -q "${REPO_URL}/Packages" -O /tmp/pkg-index || true
-              LUCI_IPK_NAME=$(grep -A5 "^Package: luci-base$" /tmp/pkg-index \
-                | grep "^Filename:" | awk '{print $2}')
-              if [ -n "$LUCI_IPK_NAME" ]; then
-                wget -q "${REPO_URL}/${LUCI_IPK_NAME}" -O /tmp/luci-base.ipk || true
-                mkdir -p /tmp/luci-extract2
-                cd /tmp/luci-extract2
-                tar -xzf /tmp/luci-base.ipk
-                tar -xzf data.tar.gz 2>/dev/null || true
-                cd -
-                LUCI_JS=$(find /tmp/luci-extract2 -name "luci.js" | head -n1)
-              fi
-            fi
-          fi
-
-          if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
-            echo "ERROR: Could not obtain luci.js for ${TAG}"
-            exit 1
-          fi
-
-          echo "✓ luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
-
-          cp "$LUCI_JS" /tmp/luci-patched.js
-          echo "" >> /tmp/luci-patched.js
-          echo "" >> /tmp/luci-patched.js
-          cat my-configs/x-wrt-customize/luci-banner.js >> /tmp/luci-patched.js
-
-          echo "✓ Banner injection appended"
-          grep -q "BANNER INJECTION" /tmp/luci-patched.js && \
-            echo "✓ Injection confirmed" || \
-            echo "WARNING: BANNER INJECTION comment not found"
-
-      - name: Stage custom files for ImageBuilder
-        run: |
-          TAG="${{ github.event.inputs.xwrt_tag }}"
-          mkdir -p imagebuilder/files/etc
-          mkdir -p imagebuilder/files/www/luci-static/resources
 
           BASE_VER=$(echo "$TAG" | grep -oP '\d+\.\d+' | head -n1)
           case "$BASE_VER" in
@@ -209,88 +154,124 @@ jobs:
             *)     CODENAME="$BASE_VER" ;;
           esac
 
-          # Strip leading 'v' from tag for display in banner
-          DISPLAY_TAG="${TAG#v}"
+          # Stage banner into source tree's files overlay
+          mkdir -p xwrt-source/files/etc
+          mkdir -p xwrt-source/files/www/luci-static/resources
 
-          sed "s|X-WRT [^,]*, .*|X-WRT ${DISPLAY_TAG}, ${CODENAME}|" \
-            my-configs/x-wrt-customize/banner > imagebuilder/files/etc/banner
+          sed "s|X-WRT [^,]*, .*|X-WRT ${TAG}, ${CODENAME}|" \
+            my-configs/x-wrt-customize/banner > xwrt-source/files/etc/banner
 
           echo "✓ Staged: /etc/banner"
-          echo "--- Banner preview ---"
-          cat imagebuilder/files/etc/banner
-          echo "--- End banner ---"
+          cat xwrt-source/files/etc/banner
 
-          cp /tmp/luci-patched.js \
-             imagebuilder/files/www/luci-static/resources/luci.js
-          echo "✓ Staged: /www/luci-static/resources/luci.js"
-
-      - name: Build ROM
+      - name: Build toolchain
         run: |
-          cd imagebuilder
-          PACKAGES="
-            luci
-            luci-ssl
-            ppp
-            ppp-mod-pppoe
-            luci-proto-wireguard
-            kmod-wireguard
-            wireguard-tools
-            zerotier
-            luci-app-zerotier
-            luci-app-wol
-            etherwake
-            redsocks
-            dns2socks
-            luci-app-commands
-            luci-app-xwan
-            luci-app-natflow-users
-            kmod-nft-nat
-            kmod-nft-offload
-            kmod-nf-conntrack
-            -wpad-basic-mbedtls
-            wpad-basic-wolfssl
-          "
-          make image \
-            PROFILE="xiaomi_mi-router-4a-gigabit" \
-            PACKAGES="$(echo $PACKAGES)" \
-            FILES="files/" \
-            2>&1 | tee build.log
+          cd xwrt-source
+          echo "Building tools..."
+          make tools/install -j$(nproc) V=s 2>&1 | tail -2
+          echo "Building toolchain..."
+          make toolchain/install -j$(nproc) V=s 2>&1 | tail -2
+          echo "✓ Toolchain ready"
+          df -h .
+
+      - name: Build firmware
+        run: |
+          cd xwrt-source
+          echo "Building firmware..."
+          make -j$(nproc) V=s 2>&1 | tee build.log | grep -E "^\s*(make\[|Compiling|Installing|Generating)" | tail -50
+          echo ""
+          echo "✓ Build complete"
+          df -h .
+
+      - name: Patch luci.js with banner injection
+        run: |
+          cd xwrt-source
+
+          # Find luci-base ipk from the build output
+          LUCI_IPK=$(find bin/ -name "luci-base*.ipk" 2>/dev/null | head -n1)
+
+          if [ -n "$LUCI_IPK" ]; then
+            echo "Found luci-base ipk: $LUCI_IPK"
+            mkdir -p /tmp/luci-extract
+            cd /tmp/luci-extract
+            # OpenWrt ipk files are ar archives
+            ar x "$LUCI_IPK" 2>/dev/null || tar -xzf "$LUCI_IPK" 2>/dev/null
+            tar -xzf data.tar.gz 2>/dev/null || tar -xf data.tar.* 2>/dev/null || true
+            cd -
+            LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
+          fi
+
+          if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
+            echo "WARNING: Could not extract luci.js — skipping LuCI banner injection"
+          else
+            echo "✓ luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
+
+            cp "$LUCI_JS" files/www/luci-static/resources/luci.js
+            echo "" >> files/www/luci-static/resources/luci.js
+            echo "" >> files/www/luci-static/resources/luci.js
+            cat $GITHUB_WORKSPACE/my-configs/x-wrt-customize/luci-banner.js >> files/www/luci-static/resources/luci.js
+
+            echo "✓ Banner injection appended"
+            grep -q "BANNER INJECTION" files/www/luci-static/resources/luci.js && \
+              echo "✓ Injection marker confirmed" || \
+              echo "WARNING: BANNER INJECTION comment not found"
+
+            # Rebuild image with the patched file overlay included
+            echo "Rebuilding image with patched luci.js..."
+            make target/install -j$(nproc) 2>&1 | tail -3
+            make package/index 2>&1 | tail -3
+            echo "✓ Rebuild with patched luci.js complete"
+          fi
+
+      - name: List build output
+        if: always()
+        run: |
+          echo "=== Build output ==="
+          find xwrt-source/bin/targets/ -type f \( -name "*sysupgrade*" -o -name "*factory*" \) 2>/dev/null || echo "No firmware files found"
 
       - name: Check for build errors
         if: always()
-        run: grep -E "^(ERROR|Collected errors)" imagebuilder/build.log || echo "No errors found"
+        run: |
+          if [ -f xwrt-source/build.log ]; then
+            grep -E "^(ERROR|Collected errors)" xwrt-source/build.log | head -20 || echo "No errors found"
+          else
+            echo "No build log found"
+          fi
 
       - name: Create GitHub Release and upload firmware
         run: |
           TAG="${{ github.event.inputs.xwrt_tag }}"
-          DISPLAY_TAG="${TAG#v}"
-          BIN=$(find imagebuilder/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)
+          BIN=$(find xwrt-source/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)
 
           [ -z "$BIN" ] && { echo "ERROR: sysupgrade.bin not found"; exit 1; }
 
-          RELEASE_TAG="xwrt-${DISPLAY_TAG}-xiaomi-4a"
+          RELEASE_TAG="xwrt-${TAG}-xiaomi-4a"
 
           gh release create "${RELEASE_TAG}" \
-            --title "X-WRT ${DISPLAY_TAG} — Xiaomi 4A Gigabit" \
-            --notes "**X-WRT ${DISPLAY_TAG}** custom build for Xiaomi Mi Router 4A Gigabit
+            --title "X-WRT ${TAG} — Xiaomi 4A Gigabit" \
+            --notes "**X-WRT ${TAG}** custom build for Xiaomi Mi Router 4A Gigabit
 
           Packages: PPPoE · WireGuard · ZeroTier · redsocks · dns2socks · luci-app-xwan · luci-app-natflow-users · WoL · HW offload
-          Customizations: SSH banner · LuCI login banner (orange)" \
-            "${BIN}" \
-            imagebuilder/build.log || \
+          Customizations: SSH banner · LuCI login banner (orange)
+
+          Built from source: github.com/x-wrt/x-wrt @ ${TAG}" \
+            "${BIN}" || \
             gh release upload "${RELEASE_TAG}" "${BIN}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload firmware as artifact (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xwrt-xiaomi-4a-${{ github.event.inputs.xwrt_tag }}
-          path: imagebuilder/bin/targets/ramips/mt7621/*sysupgrade.bin
+          path: xwrt-source/bin/targets/ramips/mt7621/*sysupgrade.bin
+          if-no-files-found: warn
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.event.inputs.xwrt_tag }}
-          path: imagebuilder/build.log
+          path: xwrt-source/build.log
+          if-no-files-found: warn
