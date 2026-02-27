@@ -1,0 +1,232 @@
+name: Build X-WRT for Xiaomi 4A Gigabit
+on:
+  workflow_dispatch:
+    inputs:
+      xwrt_tag:
+        description: 'X-WRT release tag (check github.com/x-wrt/x-wrt/tags)'
+        required: true
+        default: '24.10_b202410220658'
+
+jobs:
+  build:
+    name: Compile Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
+            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
+
+      - name: Download X-WRT ImageBuilder
+        run: |
+          TAG="${{ github.event.inputs.xwrt_tag }}"
+          BASE_URL="https://downloads.x-wrt.com/rom/${TAG}/targets/ramips/mt7621"
+          TARBALL="x-wrt-imagebuilder-${TAG}-ramips-mt7621.Linux-x86_64.tar.xz"
+
+          wget "${BASE_URL}/${TARBALL}" || {
+            echo "ERROR: Could not fetch ImageBuilder for tag ${TAG}"
+            echo "Verify tag at: https://github.com/x-wrt/x-wrt/tags"
+            exit 1
+          }
+          tar -Jxf "${TARBALL}"
+          mv x-wrt-imagebuilder-* imagebuilder
+
+      - name: Verify custom files exist in repo
+        run: |
+          echo "Checking customization files..."
+
+          [ -f "my-configs/x-wrt-customize/banner" ] || {
+            echo "ERROR: my-configs/x-wrt-customize/banner not found"
+            exit 1
+          }
+          [ -f "my-configs/x-wrt-customize/luci-banner.js" ] || {
+            echo "ERROR: my-configs/x-wrt-customize/luci-banner.js not found"
+            exit 1
+          }
+
+          echo "✓ banner found"
+          echo "✓ luci-banner.js found"
+
+          echo "--- Banner preview ---"
+          cat my-configs/x-wrt-customize/banner
+          echo "--- End banner ---"
+
+      - name: Fetch X-WRT luci.js and append banner injection
+        run: |
+          TAG="${{ github.event.inputs.xwrt_tag }}"
+          PKG_URL="https://downloads.x-wrt.com/rom/${TAG}/targets/ramips/mt7621/packages"
+
+          echo "Fetching luci package index..."
+          wget -q "${PKG_URL}/Packages" -O /tmp/pkg-index || {
+            wget -q "https://downloads.x-wrt.com/rom/${TAG}/packages/mipsel_24kc/base/Packages" \
+              -O /tmp/pkg-index
+          }
+
+          LUCI_IPK=$(grep -A5 "^Package: luci-base$" /tmp/pkg-index | grep "^Filename:" | awk '{print $2}')
+
+          if [ -n "$LUCI_IPK" ]; then
+            echo "Found luci-base ipk: $LUCI_IPK"
+            wget -q "${PKG_URL}/${LUCI_IPK}" -O /tmp/luci-base.ipk || \
+              wget -q "https://downloads.x-wrt.com/rom/${TAG}/packages/mipsel_24kc/base/${LUCI_IPK}" \
+                -O /tmp/luci-base.ipk
+
+            mkdir -p /tmp/luci-extract
+            cd /tmp/luci-extract
+            tar -xzf /tmp/luci-base.ipk
+            tar -xzf data.tar.gz ./www/luci-static/resources/luci.js 2>/dev/null || \
+              tar -xzf data.tar.gz
+            cd -
+
+            LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
+          fi
+
+          if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
+            echo "WARNING: Could not extract luci.js from ipk — falling back to wget"
+            wget -q "https://downloads.x-wrt.com/rom/${TAG}/targets/ramips/mt7621/luci.js" \
+              -O /tmp/luci.js 2>/dev/null || true
+
+            if [ ! -s /tmp/luci.js ]; then
+              echo "ERROR: Could not obtain luci.js from X-WRT for tag ${TAG}"
+              exit 1
+            fi
+            LUCI_JS="/tmp/luci.js"
+          fi
+
+          echo "✓ X-WRT luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
+
+          cp "$LUCI_JS" /tmp/luci-patched.js
+          echo "" >> /tmp/luci-patched.js
+          echo "" >> /tmp/luci-patched.js
+          cat my-configs/x-wrt-customize/luci-banner.js >> /tmp/luci-patched.js
+
+          echo "✓ Banner injection appended"
+          echo "Final luci.js size: $(wc -c < /tmp/luci-patched.js) bytes"
+
+          grep -q "BANNER INJECTION" /tmp/luci-patched.js && \
+            echo "✓ Injection block confirmed" || \
+            echo "WARNING: BANNER INJECTION comment not found — check luci-banner.js"
+
+      - name: Stage custom files for ImageBuilder
+        run: |
+          TAG="${{ github.event.inputs.xwrt_tag }}"
+          mkdir -p imagebuilder/files/etc
+          mkdir -p imagebuilder/files/www/luci-static/resources
+
+          # Update version line in banner to match build tag
+          BASE_VER=$(echo "$TAG" | sed 's/_b[0-9]*//')
+          case "$BASE_VER" in
+            24.10) CODENAME="Resolute" ;;
+            26.04) CODENAME="Resolute" ;;
+            *)     CODENAME="$BASE_VER" ;;
+          esac
+
+          sed "s|X-WRT [^,]*, .*|X-WRT ${TAG}, ${CODENAME}|" \
+            my-configs/x-wrt-customize/banner > imagebuilder/files/etc/banner
+
+          echo "✓ Staged: /etc/banner (version updated to ${TAG})"
+          echo "--- Banner preview ---"
+          cat imagebuilder/files/etc/banner
+          echo "--- End banner ---"
+
+          cp /tmp/luci-patched.js \
+             imagebuilder/files/www/luci-static/resources/luci.js
+          echo "✓ Staged: /www/luci-static/resources/luci.js"
+
+          echo "All staged files:"
+          find imagebuilder/files -type f -ls
+
+      - name: Build ROM
+        run: |
+          cd imagebuilder
+          PACKAGES="
+            luci
+            luci-ssl
+            ppp
+            ppp-mod-pppoe
+            luci-proto-wireguard
+            kmod-wireguard
+            wireguard-tools
+            zerotier
+            luci-app-zerotier
+            luci-app-wol
+            etherwake
+            redsocks
+            dns2socks
+            luci-app-commands
+            kmod-nft-nat
+            kmod-nft-offload
+            kmod-nf-conntrack
+            luci-app-xwan
+            luci-app-natflow-users
+            -wpad-basic-mbedtls
+            wpad-basic-wolfssl
+          "
+          make image \
+            PROFILE="xiaomi_mi-router-4a-gigabit" \
+            PACKAGES="$(echo $PACKAGES)" \
+            FILES="files/" \
+            2>&1 | tee build.log
+
+      - name: Check for build errors
+        if: always()
+        run: grep -E "^(ERROR|Collected errors)" imagebuilder/build.log || echo "No errors found"
+
+      - name: Create GitHub Release and upload firmware
+        run: |
+          TAG_INPUT="${{ github.event.inputs.xwrt_tag }}"
+          BIN=$(find imagebuilder/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)
+
+          if [ -z "$BIN" ]; then
+            echo "ERROR: sysupgrade.bin not found — build likely failed"
+            exit 1
+          fi
+
+          # Tag format: xwrt-24.10_b202410220658-xiaomi-4a
+          TAG="xwrt-${TAG_INPUT}-xiaomi-4a"
+
+          gh release create "${TAG}" \
+            --title "X-WRT ${TAG_INPUT} — Xiaomi 4A Gigabit" \
+            --notes "**X-WRT ${TAG_INPUT}** custom build for Xiaomi Mi Router 4A Gigabit
+
+          **Packages included:**
+          - PPPoE WAN
+          - WireGuard + LuCI proto
+          - ZeroTier + luci-app-zerotier
+          - redsocks + dns2socks
+          - luci-app-wol + etherwake
+          - luci-app-commands
+          - luci-app-xwan (WAN status widget)
+          - luci-app-natflow-users (per-client bandwidth)
+          - Hardware flow offloading (kmod-nft-offload)
+
+          **Customizations:**
+          - Custom SSH banner
+          - LuCI login banner (X-WRT orange)" \
+            "${BIN}" \
+            imagebuilder/build.log || {
+              echo "WARNING: Release ${TAG} may already exist — uploading asset only"
+              gh release upload "${TAG}" "${BIN}" --clobber
+            }
+
+          echo "✓ Release created: ${TAG}"
+          echo "URL: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload firmware as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xwrt-xiaomi-4a-${{ github.event.inputs.xwrt_tag }}
+          path: imagebuilder/bin/targets/ramips/mt7621/*sysupgrade.bin
+
+      - name: Upload build log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.event.inputs.xwrt_tag }}
+          path: imagebuilder/build.log

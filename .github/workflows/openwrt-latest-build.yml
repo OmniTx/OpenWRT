@@ -1,0 +1,259 @@
+name: Build OpenWrt for Xiaomi 4A Gigabit (Latest Stable)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
+            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
+
+      - name: Detect Latest Stable OpenWrt Version
+        id: openwrt_version
+        run: |
+          LATEST=$(wget -qO- https://downloads.openwrt.org/releases/ \
+            | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(?=/)' \
+            | grep -v 'rc\|beta\|SNAPSHOT' \
+            | sort -V \
+            | tail -n1)
+
+          if [ -z "$LATEST" ]; then
+            echo "ERROR: Could not detect latest OpenWrt stable version"
+            exit 1
+          fi
+
+          echo "Latest stable OpenWrt: ${LATEST}"
+          echo "version=${LATEST}" >> $GITHUB_OUTPUT
+
+      - name: Download OpenWrt ImageBuilder
+        run: |
+          VERSION="${{ steps.openwrt_version.outputs.version }}"
+          BASE_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/ramips/mt7621"
+          TARBALL="openwrt-imagebuilder-${VERSION}-ramips-mt7621.Linux-x86_64.tar.xz"
+
+          wget "${BASE_URL}/${TARBALL}" || {
+            echo "ERROR: Could not fetch ImageBuilder for version ${VERSION}"
+            exit 1
+          }
+          tar -Jxf "${TARBALL}"
+          mv openwrt-imagebuilder-* imagebuilder
+          echo "✓ ImageBuilder ready"
+
+      - name: Verify custom files exist in repo
+        run: |
+          [ -f "my-configs/x-wrt-customize/banner" ] || {
+            echo "ERROR: my-configs/x-wrt-customize/banner not found"
+            exit 1
+          }
+          [ -f "my-configs/x-wrt-customize/luci-banner.js" ] || {
+            echo "ERROR: my-configs/x-wrt-customize/luci-banner.js not found"
+            exit 1
+          }
+          echo "✓ banner found"
+          echo "✓ luci-banner.js found"
+
+      - name: Patch banner injection color for OpenWrt
+        run: |
+          # Repo file uses X-WRT orange #F37320 as base
+          # OpenWrt build swaps to official OpenWrt blue #4a9de0 at build time
+          # X-WRT workflow reads the file directly — untouched
+          sed 's/#F37320/#4a9de0/g' \
+            my-configs/x-wrt-customize/luci-banner.js > /tmp/luci-banner-patched.js
+
+          echo "✓ Color patched: #F37320 → #4a9de0"
+          grep "color" /tmp/luci-banner-patched.js
+
+      - name: Fetch OpenWrt luci.js and append banner injection
+        run: |
+          VERSION="${{ steps.openwrt_version.outputs.version }}"
+
+          # Try target packages first, then the luci feed
+          PKG_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/ramips/mt7621/packages"
+          LUCI_FEED="https://downloads.openwrt.org/releases/${VERSION}/packages/mipsel_24kc/luci"
+
+          echo "Fetching package index..."
+          wget -q "${PKG_URL}/Packages" -O /tmp/pkg-index || \
+            wget -q "${LUCI_FEED}/Packages" -O /tmp/pkg-index
+
+          LUCI_IPK=$(grep -A5 "^Package: luci-base$" /tmp/pkg-index \
+            | grep "^Filename:" | awk '{print $2}')
+
+          if [ -n "$LUCI_IPK" ]; then
+            echo "Found luci-base ipk: $LUCI_IPK"
+            wget -q "${PKG_URL}/${LUCI_IPK}" -O /tmp/luci-base.ipk || \
+              wget -q "${LUCI_FEED}/${LUCI_IPK}" -O /tmp/luci-base.ipk
+
+            mkdir -p /tmp/luci-extract
+            cd /tmp/luci-extract
+            tar -xzf /tmp/luci-base.ipk
+            tar -xzf data.tar.gz ./www/luci-static/resources/luci.js 2>/dev/null || \
+              tar -xzf data.tar.gz
+            cd -
+
+            LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
+          fi
+
+          if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
+            echo "WARNING: Could not extract from ipk — falling back to direct fetch"
+            wget -q "${PKG_URL}/luci.js" -O /tmp/luci.js 2>/dev/null || true
+            [ -s /tmp/luci.js ] || {
+              echo "ERROR: Could not obtain luci.js for OpenWrt ${VERSION}"
+              exit 1
+            }
+            LUCI_JS="/tmp/luci.js"
+          fi
+
+          echo "✓ OpenWrt luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
+
+          # Append blue-colored banner injection
+          cp "$LUCI_JS" /tmp/luci-patched.js
+          echo "" >> /tmp/luci-patched.js
+          echo "" >> /tmp/luci-patched.js
+          cat /tmp/luci-banner-patched.js >> /tmp/luci-patched.js
+
+          echo "✓ Banner injection appended"
+          echo "Final luci.js size: $(wc -c < /tmp/luci-patched.js) bytes"
+
+          grep -q "BANNER INJECTION" /tmp/luci-patched.js && \
+            echo "✓ Injection confirmed" || \
+            echo "WARNING: BANNER INJECTION comment not found"
+
+      - name: Stage custom files for ImageBuilder
+        run: |
+          VERSION="${{ steps.openwrt_version.outputs.version }}"
+          mkdir -p imagebuilder/files/etc
+          mkdir -p imagebuilder/files/www/luci-static/resources
+
+          # Map version to OpenWrt codename
+          BASE_VER=$(echo "$VERSION" | grep -oP '^\d+\.\d+')
+          case "$BASE_VER" in
+            23.05) CODENAME="Reef" ;;
+            24.10) CODENAME="Snapshot" ;;
+            22.03) CODENAME="Firehorse" ;;
+            21.02) CODENAME="Impala" ;;
+            *)     CODENAME="Stable" ;;
+          esac
+
+          # Replace X-WRT version line with OpenWrt version
+          sed "s|X-WRT [^,]*, .*|OpenWrt ${VERSION}, ${CODENAME}|" \
+            my-configs/x-wrt-customize/banner > imagebuilder/files/etc/banner
+
+          echo "✓ Staged: /etc/banner"
+          echo "--- Banner preview ---"
+          cat imagebuilder/files/etc/banner
+          echo "--- End banner ---"
+
+          cp /tmp/luci-patched.js \
+             imagebuilder/files/www/luci-static/resources/luci.js
+          echo "✓ Staged: /www/luci-static/resources/luci.js"
+
+          echo "All staged files:"
+          find imagebuilder/files -type f -ls
+
+      - name: Build ROM
+        run: |
+          cd imagebuilder
+          PACKAGES="
+            luci
+            luci-ssl
+            ppp
+            ppp-mod-pppoe
+            luci-proto-wireguard
+            kmod-wireguard
+            wireguard-tools
+            zerotier
+            luci-app-zerotier
+            luci-app-wol
+            etherwake
+            redsocks
+            dns2socks
+            luci-app-commands
+            kmod-nft-nat
+            kmod-nft-offload
+            kmod-nf-conntrack
+            -wpad-basic-mbedtls
+            wpad-basic-wolfssl
+          "
+          make image \
+            PROFILE="xiaomi_mi-router-4a-gigabit" \
+            PACKAGES="$(echo $PACKAGES)" \
+            FILES="files/" \
+            2>&1 | tee build.log
+
+      - name: Check for build errors
+        if: always()
+        run: |
+          VERSION="${{ steps.openwrt_version.outputs.version }}"
+          echo "Built OpenWrt version: ${VERSION}"
+          grep -E "^(ERROR|Collected errors)" imagebuilder/build.log || echo "No errors found"
+
+      - name: Create GitHub Release and upload firmware
+        run: |
+          VERSION="${{ steps.openwrt_version.outputs.version }}"
+          BIN=$(find imagebuilder/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)
+
+          if [ -z "$BIN" ]; then
+            echo "ERROR: sysupgrade.bin not found — build likely failed"
+            exit 1
+          fi
+
+          # Tag format: openwrt-23.05.5-xiaomi-4a
+          TAG="openwrt-${VERSION}-xiaomi-4a"
+
+          # Create the release and upload the bin in one gh command
+          gh release create "${TAG}" \
+            --title "OpenWrt ${VERSION} — Xiaomi 4A Gigabit" \
+            --notes "**OpenWrt ${VERSION}** custom build for Xiaomi Mi Router 4A Gigabit
+
+          **Packages included:**
+          - PPPoE WAN
+          - WireGuard + LuCI proto
+          - ZeroTier
+          - redsocks + dns2socks
+          - luci-app-wol + etherwake
+          - luci-app-commands
+          - Hardware flow offloading (kmod-nft-offload)
+
+          **Customizations:**
+          - Custom SSH banner
+          - LuCI login banner (OpenWrt blue)
+
+          Built automatically from latest stable OpenWrt." \
+            "${BIN}" \
+            imagebuilder/build.log || {
+              # Release may already exist if same version built twice
+              echo "WARNING: Release ${TAG} may already exist — uploading asset only"
+              gh release upload "${TAG}" "${BIN}" --clobber
+            }
+
+          echo "✓ Release created: ${TAG}"
+          echo "URL: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload firmware as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-xiaomi-4a-${{ steps.openwrt_version.outputs.version }}
+          path: imagebuilder/bin/targets/ramips/mt7621/*sysupgrade.bin
+
+      - name: Upload build log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-openwrt-${{ steps.openwrt_version.outputs.version }}
+          path: imagebuilder/build.log

@@ -4,6 +4,23 @@ Welcome to my OpenWrt repository! This project serves as a central hub for every
 
 ## 📁 Repository Structure
 
+```text
+OpenWRT/
+├── apps/                              # OpenWrt packages, custom scripts, and applications
+│   └── luci-app-wgvpn/                # Custom WireGuard VPN LuCI application
+├── backups/                           # (Coming Soon) Routine router configuration backups
+├── guides/                            # (Coming Soon) Tutorials and setup guides
+├── my-configs/                        # Custom shell scripts and specific network setups
+│   ├── x-wrt-customize/               # Specific customizations for X-WRT firmware
+│   ├── vpn-secrets.conf.example       # Template for providing secure credentials
+│   ├── wireguard-setup-basic.sh       # Basic isolated VPN setup script
+│   ├── wireguard-setup-x-wrt.sh       # X-WRT optimized VPN setup script
+│   ├── zerotier-setup-x-wrt.sh        # ZeroTier configuration script
+│   ├── uci export.txt                 # Exported UCI configuration backup
+│   └── README.md                      # Details about the configurations
+└── README.md                          # This documentation file
+```
+
 This repository is organized into the following sections:
 
 - **[`my-configs/`](./my-configs/)**
