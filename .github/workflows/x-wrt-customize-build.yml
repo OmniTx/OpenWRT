@@ -32,45 +32,94 @@ jobs:
           echo "Fetching release asset list for tag ${TAG}..."
 
           # Use GitHub API to list all assets for this release
-          # No auth needed for public repos — but rate limit is 60/hr unauthenticated
-          # Using GITHUB_TOKEN gives 1000/hr
           ASSETS=$(curl -sL \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/x-wrt/build-release/releases/tags/${TAG}")
 
-          # Find the ramips-mt7621 ImageBuilder asset
-          # Asset name pattern: x-wrt-imagebuilder-*-ramips-mt7621*.tar.xz
+          # x-wrt releases bundle everything in zip files per target/device.
+          # The ImageBuilder .tar.xz is INSIDE the zip, not a standalone asset.
+          #
+          # New releases (v26+): per-device zips like x-wrt-ramips-mt7621-apps.zip
+          #   The "-apps.zip" contains the ImageBuilder + packages
+          # Old releases (v23): per-target zips like x-wrt-23.10_b...-ramips-mt7621.zip
+          #   The full target zip contains everything including ImageBuilder
           ASSET_URL=$(echo "$ASSETS" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           assets = data.get('assets', [])
+
+          # Priority 1: look for ramips-mt7621 apps zip (new format, smaller, has ImageBuilder)
           for a in assets:
-              name = a['name']
-              if 'imagebuilder' in name and 'ramips-mt7621' in name and name.endswith('.tar.xz'):
+              name = a['name'].lower()
+              if 'ramips-mt7621' in name and 'apps' in name and name.endswith('.zip'):
                   print(a['browser_download_url'])
-                  break
+                  sys.exit(0)
+
+          # Priority 2: look for ramips-mt7621 target zip (old format, large but has everything)
+          #   Exclude ext4fs and nosymbol variants
+          for a in assets:
+              name = a['name'].lower()
+              if 'ramips-mt7621' in name and name.endswith('.zip'):
+                  if 'ext4fs' not in name and 'nosymbol' not in name:
+                      print(a['browser_download_url'])
+                      sys.exit(0)
+
+          # Priority 3: any ramips-mt7621 zip at all
+          for a in assets:
+              name = a['name'].lower()
+              if 'ramips-mt7621' in name and name.endswith('.zip'):
+                  print(a['browser_download_url'])
+                  sys.exit(0)
           ")
 
           if [ -z "$ASSET_URL" ]; then
-            echo "ERROR: Could not find ramips-mt7621 ImageBuilder in release ${TAG}"
-            echo "Available assets:"
+            echo "ERROR: Could not find ramips-mt7621 zip in release ${TAG}"
+            echo "Available ramips assets:"
             echo "$ASSETS" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           for a in data.get('assets', []):
-              print(' ', a['name'])
-          " | grep -i "imagebuilder" || echo "  (no imagebuilder assets found)"
+              if 'ramips' in a['name'].lower():
+                  print('  ', a['name'])
+          " || echo "  (no ramips assets found)"
             echo ""
+            echo "All assets:"
+            echo "$ASSETS" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for a in data.get('assets', []):
+              print('  ', a['name'])
+          " | head -30
             echo "Check release at: https://github.com/x-wrt/build-release/releases/tag/${TAG}"
             exit 1
           fi
 
-          echo "Found ImageBuilder: $ASSET_URL"
-          wget "$ASSET_URL" -O imagebuilder.tar.xz
-          tar -Jxf imagebuilder.tar.xz
-          mv x-wrt-imagebuilder-* imagebuilder
+          echo "Found target zip: $ASSET_URL"
+          wget "$ASSET_URL" -O target.zip
+
+          echo "Extracting zip..."
+          mkdir -p /tmp/xwrt-extract
+          unzip -q target.zip -d /tmp/xwrt-extract
+
+          echo "Looking for ImageBuilder tarball inside zip..."
+          IB_TAR=$(find /tmp/xwrt-extract -name "*imagebuilder*ramips*mt7621*.tar.xz" -o -name "*imagebuilder*.tar.xz" 2>/dev/null | head -n1)
+
+          if [ -z "$IB_TAR" ]; then
+            echo "Contents of extracted zip:"
+            find /tmp/xwrt-extract -type f | head -50
+            echo ""
+            echo "ERROR: No ImageBuilder tarball found inside the zip"
+            echo "This release may not include an ImageBuilder for ramips-mt7621"
+            exit 1
+          fi
+
+          echo "Found ImageBuilder tarball: $IB_TAR"
+          tar -Jxf "$IB_TAR"
+          mv x-wrt-imagebuilder-* imagebuilder 2>/dev/null || \
+            mv *imagebuilder* imagebuilder 2>/dev/null
           echo "✓ ImageBuilder ready"
+          ls -la imagebuilder/
 
       - name: Verify custom files exist in repo
         run: |
