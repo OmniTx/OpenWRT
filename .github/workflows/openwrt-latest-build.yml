@@ -228,7 +228,7 @@ jobs:
             sdk/package/dns2socks
 
           # Clone luci-app-zerotier OpenWrt package recipe (fw4 compatible for OpenWrt 22.03+)
-          git clone --depth 1 https://github.com/taksssss/luci-app-zerotier-fw4.git \
+          git clone --depth 1 https://github.com/zhengmz/luci-app-zerotier.git \
             sdk/package/luci-app-zerotier
 
           cd sdk
