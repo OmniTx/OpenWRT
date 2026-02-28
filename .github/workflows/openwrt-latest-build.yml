@@ -1,6 +1,16 @@
-name: Build OpenWrt for Xiaomi 4A Gigabit (Latest Stable)
+name: Build OpenWrt for Xiaomi 4A Gigabit
 on:
   workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt version (e.g. 23.05.5) or "latest"'
+        required: true
+        default: 'latest'
+      patch_luci:
+        description: 'Inject custom LuCI login banner (luci-banner.js)'
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: '0 0 * * 1'
 
@@ -22,22 +32,31 @@ jobs:
           sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
 
-      - name: Detect Latest Stable OpenWrt Version
+      - name: Resolve OpenWrt Version
         id: openwrt_version
         run: |
-          LATEST=$(wget -qO- https://downloads.openwrt.org/releases/ \
-            | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(?=/)' \
-            | grep -v 'rc\|beta\|SNAPSHOT' \
-            | sort -V \
-            | tail -n1)
+          INPUT_VERSION="${{ github.event.inputs.openwrt_version }}"
+          
+          # If triggered by schedule, INPUT_VERSION will be empty, so we default to "latest" safely
+          if [ -z "$INPUT_VERSION" ] || [ "$INPUT_VERSION" = "latest" ]; then
+            echo "Detecting latest stable OpenWrt version..."
+            LATEST=$(wget -qO- https://downloads.openwrt.org/releases/ \
+              | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(?=/)' \
+              | grep -v 'rc\|beta\|SNAPSHOT' \
+              | sort -V \
+              | tail -n1)
 
-          if [ -z "$LATEST" ]; then
-            echo "ERROR: Could not detect latest OpenWrt stable version"
-            exit 1
+            if [ -z "$LATEST" ]; then
+              echo "ERROR: Could not detect latest OpenWrt stable version"
+              exit 1
+            fi
+
+            echo "Latest stable OpenWrt: ${LATEST}"
+            echo "version=${LATEST}" >> $GITHUB_OUTPUT
+          else
+            echo "Using specified OpenWrt version: ${INPUT_VERSION}"
+            echo "version=${INPUT_VERSION}" >> $GITHUB_OUTPUT
           fi
-
-          echo "Latest stable OpenWrt: ${LATEST}"
-          echo "version=${LATEST}" >> $GITHUB_OUTPUT
 
       - name: Download OpenWrt ImageBuilder
         run: |
@@ -59,14 +78,18 @@ jobs:
             echo "ERROR: my-configs/x-wrt-customize/banner not found"
             exit 1
           }
-          [ -f "my-configs/x-wrt-customize/luci-banner.js" ] || {
-            echo "ERROR: my-configs/x-wrt-customize/luci-banner.js not found"
-            exit 1
-          }
           echo "✓ banner found"
-          echo "✓ luci-banner.js found"
+
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.patch_luci }}" = "true" ] || [ -z "${{ github.event.inputs.patch_luci }}" ]; then
+            [ -f "my-configs/x-wrt-customize/luci-banner.js" ] || {
+              echo "ERROR: my-configs/x-wrt-customize/luci-banner.js not found"
+              exit 1
+            }
+            echo "✓ luci-banner.js found"
+          fi
 
       - name: Patch banner injection color for OpenWrt
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.patch_luci == 'true' || github.event.inputs.patch_luci == '' }}
         run: |
           # Repo file uses X-WRT orange #F37320 as base
           # OpenWrt build swaps to official OpenWrt blue #4a9de0 at build time
@@ -78,6 +101,8 @@ jobs:
           grep "color" /tmp/luci-banner-patched.js
 
       - name: Fetch OpenWrt luci.js and append banner injection
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.patch_luci == 'true' || github.event.inputs.patch_luci == '' }}
+        continue-on-error: true
         run: |
           VERSION="${{ steps.openwrt_version.outputs.version }}"
 
@@ -99,9 +124,19 @@ jobs:
 
             mkdir -p /tmp/luci-extract
             cd /tmp/luci-extract
-            tar -xzf /tmp/luci-base.ipk
-            tar -xzf data.tar.gz ./www/luci-static/resources/luci.js 2>/dev/null || \
-              tar -xzf data.tar.gz
+            
+            EXTRACTED=false
+            if command -v ar >/dev/null 2>&1; then
+              ar x /tmp/luci-base.ipk 2>/dev/null && EXTRACTED=true
+            fi
+            if [ "$EXTRACTED" = false ]; then
+              tar -xzf /tmp/luci-base.ipk 2>/dev/null && EXTRACTED=true
+            fi
+            if [ "$EXTRACTED" = false ]; then
+              tar --zstd -xf /tmp/luci-base.ipk 2>/dev/null && EXTRACTED=true
+            fi
+
+            tar -xzf data.tar.gz 2>/dev/null || tar -xf data.tar.* 2>/dev/null || true
             cd -
 
             LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
@@ -157,9 +192,11 @@ jobs:
           cat imagebuilder/files/etc/banner
           echo "--- End banner ---"
 
-          cp /tmp/luci-patched.js \
-             imagebuilder/files/www/luci-static/resources/luci.js
-          echo "✓ Staged: /www/luci-static/resources/luci.js"
+          if [ -f /tmp/luci-patched.js ]; then
+            cp /tmp/luci-patched.js \
+               imagebuilder/files/www/luci-static/resources/luci.js
+            echo "✓ Staged: /www/luci-static/resources/luci.js"
+          fi
 
           echo "All staged files:"
           find imagebuilder/files -type f -ls
@@ -202,6 +239,7 @@ jobs:
           grep -E "^(ERROR|Collected errors)" imagebuilder/build.log || echo "No errors found"
 
       - name: Create GitHub Release and upload firmware
+        if: always()
         run: |
           VERSION="${{ steps.openwrt_version.outputs.version }}"
           BIN=$(find imagebuilder/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)

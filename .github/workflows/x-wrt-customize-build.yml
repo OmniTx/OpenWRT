@@ -6,6 +6,11 @@ on:
         description: 'X-WRT source tag from github.com/x-wrt/x-wrt/tags (WITHOUT v prefix, e.g. 23.10_b202312150123)'
         required: true
         default: '23.10_b202312150123'
+      xwrt_defaults:
+        description: 'Include X-WRT defaults (WiFi AP X-WRT_XXXX, admin user, 192.168.15.1, theme, wizard)'
+        required: false
+        type: boolean
+        default: true
       patch_luci:
         description: 'Inject custom LuCI login banner (luci-banner.js)'
         required: false
@@ -111,6 +116,28 @@ jobs:
           # Proxy tools
           CONFIG_PACKAGE_redsocks=y
           CONFIG_PACKAGE_dns2socks=y
+
+          EOF
+
+          # Conditionally add X-WRT core defaults
+          if [ "${{ github.event.inputs.xwrt_defaults }}" = "true" ]; then
+            echo "Adding X-WRT default packages..."
+            cat >> .config << 'XWRT_EOF'
+          # X-WRT core defaults (WiFi AP X-WRT_XXXX, admin user, LAN IP 192.168.15.1, etc.)
+          CONFIG_PACKAGE_base-config-setting=y
+          CONFIG_PACKAGE_natcap=y
+          CONFIG_PACKAGE_natflow=y
+          CONFIG_PACKAGE_luci-app-natcap=y
+          CONFIG_PACKAGE_luci-app-wizard=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_x-wrt-logo=y
+          XWRT_EOF
+          else
+            echo "Skipping X-WRT defaults — vanilla OpenWrt experience"
+          fi
+
+          # Continue with remaining packages
+          cat >> .config << 'EOF'
 
           # X-WRT specific apps
           CONFIG_PACKAGE_luci-app-commands=y
