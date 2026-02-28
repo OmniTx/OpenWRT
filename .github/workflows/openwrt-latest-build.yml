@@ -227,24 +227,39 @@ jobs:
           git clone --depth 1 https://github.com/kongfl888/openwrt-dns2socks.git \
             sdk/package/dns2socks
 
+          # Clone luci-app-zerotier OpenWrt package recipe
+          git clone --depth 1 https://github.com/rufengsuixing/luci-app-zerotier.git \
+            sdk/package/luci-app-zerotier
+
           cd sdk
           # Update feeds and install dependencies
           ./scripts/feeds update -a 2>&1 | tail -3
           ./scripts/feeds install -a 2>&1 | tail -3
 
-          # Build dns2socks
+          # Build packages
           make defconfig 2>&1 | tail -3
+          echo "Compiling dns2socks..."
           make package/dns2socks/compile V=s -j$(nproc) 2>&1 | tail -20
+          echo "Compiling luci-app-zerotier..."
+          make package/luci-app-zerotier/compile V=s -j$(nproc) 2>&1 | tail -20
 
-          # Find and copy the built ipk into ImageBuilder's packages dir
+          # Find and copy the built ipks into ImageBuilder's packages dir
           DNS2SOCKS_IPK=$(find bin/ -name "dns2socks*.ipk" | head -n1)
+          ZEROTIER_IPK=$(find bin/ -name "luci-app-zerotier*.ipk" | head -n1)
+
           if [ -z "$DNS2SOCKS_IPK" ]; then
             echo "ERROR: dns2socks ipk not found after SDK build"
             exit 1
           fi
+          if [ -z "$ZEROTIER_IPK" ]; then
+            echo "ERROR: luci-app-zerotier ipk not found after SDK build"
+            exit 1
+          fi
 
           echo "✓ dns2socks compiled: $DNS2SOCKS_IPK"
+          echo "✓ luci-app-zerotier compiled: $ZEROTIER_IPK"
           cp "$DNS2SOCKS_IPK" "$GITHUB_WORKSPACE/imagebuilder/packages/"
+          cp "$ZEROTIER_IPK" "$GITHUB_WORKSPACE/imagebuilder/packages/"
           # Regenerate the local packages index so opkg can discover dns2socks
           cd "$GITHUB_WORKSPACE/imagebuilder"
           echo "Building package index using ImageBuilder..."
