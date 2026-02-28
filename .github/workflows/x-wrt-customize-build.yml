@@ -321,6 +321,11 @@ jobs:
 
           [ -z "$BIN" ] && { echo "ERROR: sysupgrade.bin not found"; exit 1; }
 
+          # Replace the binary file name with a unique timestamp to prevent clobbering
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          UNIQUE_BIN="$(dirname "$BIN")/xwrt-${TAG}-xiaomi-4a-${TIMESTAMP}-sysupgrade.bin"
+          mv "$BIN" "$UNIQUE_BIN"
+
           RELEASE_TAG="xwrt-${TAG}-xiaomi-4a"
 
           gh release create "${RELEASE_TAG}" \
@@ -331,8 +336,8 @@ jobs:
           Customizations: SSH banner · LuCI login banner (orange)
 
           Built from source: github.com/x-wrt/x-wrt @ ${TAG}" \
-            "${BIN}" || \
-            gh release upload "${RELEASE_TAG}" "${BIN}" --clobber
+            "${UNIQUE_BIN}" || \
+            gh release upload "${RELEASE_TAG}" "${UNIQUE_BIN}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

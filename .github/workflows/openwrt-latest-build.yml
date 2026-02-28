@@ -249,6 +249,11 @@ jobs:
             exit 1
           fi
 
+          # Give the binary a unique timestamp to prevent clobbering
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          UNIQUE_BIN="$(dirname "$BIN")/openwrt-${VERSION}-xiaomi-4a-${TIMESTAMP}-sysupgrade.bin"
+          mv "$BIN" "$UNIQUE_BIN"
+
           # Tag format: openwrt-23.05.5-xiaomi-4a
           TAG="openwrt-${VERSION}-xiaomi-4a"
 
@@ -271,11 +276,11 @@ jobs:
           - LuCI login banner (OpenWrt blue)
 
           Built automatically from latest stable OpenWrt." \
-            "${BIN}" \
+            "${UNIQUE_BIN}" \
             imagebuilder/build.log || {
               # Release may already exist if same version built twice
               echo "WARNING: Release ${TAG} may already exist — uploading asset only"
-              gh release upload "${TAG}" "${BIN}" --clobber
+              gh release upload "${TAG}" "${UNIQUE_BIN}"
             }
 
           echo "✓ Release created: ${TAG}"
