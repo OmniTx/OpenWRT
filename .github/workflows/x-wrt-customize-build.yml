@@ -6,6 +6,11 @@ on:
         description: 'X-WRT source tag from github.com/x-wrt/x-wrt/tags (WITHOUT v prefix, e.g. 23.10_b202312150123)'
         required: true
         default: '23.10_b202312150123'
+      patch_luci:
+        description: 'Inject custom LuCI login banner (luci-banner.js)'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -184,44 +189,87 @@ jobs:
           df -h .
 
       - name: Patch luci.js with banner injection
+        if: ${{ github.event.inputs.patch_luci == 'true' }}
+        continue-on-error: true
         run: |
           cd xwrt-source
 
-          # Find luci-base ipk from the build output
-          LUCI_IPK=$(find bin/ -name "luci-base*.ipk" 2>/dev/null | head -n1)
+          # Find luci-base ipk from the build output (use absolute path)
+          LUCI_IPK=$(find "$GITHUB_WORKSPACE/xwrt-source/bin/" -name "luci-base*.ipk" 2>/dev/null | head -n1)
 
-          if [ -n "$LUCI_IPK" ]; then
-            echo "Found luci-base ipk: $LUCI_IPK"
-            mkdir -p /tmp/luci-extract
-            cd /tmp/luci-extract
-            # OpenWrt ipk files are ar archives
-            ar x "$LUCI_IPK" 2>/dev/null || tar -xzf "$LUCI_IPK" 2>/dev/null
-            tar -xzf data.tar.gz 2>/dev/null || tar -xf data.tar.* 2>/dev/null || true
-            cd -
-            LUCI_JS=$(find /tmp/luci-extract -name "luci.js" | head -n1)
+          if [ -z "$LUCI_IPK" ]; then
+            echo "WARNING: luci-base ipk not found in build output — skipping"
+            exit 0
           fi
+
+          echo "Found luci-base ipk: $LUCI_IPK"
+          mkdir -p /tmp/luci-extract
+
+          # Try multiple extraction methods (ipk can be ar or tar.gz format)
+          EXTRACTED=false
+          # Method 1: ar archive (newer OpenWrt)
+          if command -v ar >/dev/null 2>&1; then
+            cp "$LUCI_IPK" /tmp/luci-extract/luci-base.ipk
+            cd /tmp/luci-extract
+            if ar x luci-base.ipk 2>/dev/null; then
+              echo "Extracted with ar"
+              EXTRACTED=true
+            fi
+            cd "$GITHUB_WORKSPACE/xwrt-source"
+          fi
+          # Method 2: gzip tar (older OpenWrt)
+          if [ "$EXTRACTED" = false ]; then
+            cd /tmp/luci-extract
+            if tar -xzf "$LUCI_IPK" 2>/dev/null; then
+              echo "Extracted with tar -xzf"
+              EXTRACTED=true
+            fi
+            cd "$GITHUB_WORKSPACE/xwrt-source"
+          fi
+          # Method 3: zstd tar (very new OpenWrt)
+          if [ "$EXTRACTED" = false ]; then
+            cd /tmp/luci-extract
+            if tar --zstd -xf "$LUCI_IPK" 2>/dev/null; then
+              echo "Extracted with tar --zstd"
+              EXTRACTED=true
+            fi
+            cd "$GITHUB_WORKSPACE/xwrt-source"
+          fi
+
+          if [ "$EXTRACTED" = false ]; then
+            echo "WARNING: Could not extract ipk with any method — skipping banner injection"
+            exit 0
+          fi
+
+          # Extract the data archive inside the ipk
+          cd /tmp/luci-extract
+          tar -xzf data.tar.gz 2>/dev/null || tar -xf data.tar.* 2>/dev/null || true
+          cd "$GITHUB_WORKSPACE/xwrt-source"
+
+          LUCI_JS=$(find /tmp/luci-extract -name "luci.js" 2>/dev/null | head -n1)
 
           if [ -z "$LUCI_JS" ] || [ ! -f "$LUCI_JS" ]; then
-            echo "WARNING: Could not extract luci.js — skipping LuCI banner injection"
-          else
-            echo "✓ luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
-
-            cp "$LUCI_JS" files/www/luci-static/resources/luci.js
-            echo "" >> files/www/luci-static/resources/luci.js
-            echo "" >> files/www/luci-static/resources/luci.js
-            cat $GITHUB_WORKSPACE/my-configs/x-wrt-customize/luci-banner.js >> files/www/luci-static/resources/luci.js
-
-            echo "✓ Banner injection appended"
-            grep -q "BANNER INJECTION" files/www/luci-static/resources/luci.js && \
-              echo "✓ Injection marker confirmed" || \
-              echo "WARNING: BANNER INJECTION comment not found"
-
-            # Rebuild image with the patched file overlay included
-            echo "Rebuilding image with patched luci.js..."
-            make target/install -j$(nproc) 2>&1 | tail -3
-            make package/index 2>&1 | tail -3
-            echo "✓ Rebuild with patched luci.js complete"
+            echo "WARNING: luci.js not found inside ipk — skipping banner injection"
+            exit 0
           fi
+
+          echo "✓ luci.js obtained ($(wc -c < "$LUCI_JS") bytes)"
+
+          cp "$LUCI_JS" files/www/luci-static/resources/luci.js
+          echo "" >> files/www/luci-static/resources/luci.js
+          echo "" >> files/www/luci-static/resources/luci.js
+          cat "$GITHUB_WORKSPACE/my-configs/x-wrt-customize/luci-banner.js" >> files/www/luci-static/resources/luci.js
+
+          echo "✓ Banner injection appended"
+          grep -q "BANNER INJECTION" files/www/luci-static/resources/luci.js && \
+            echo "✓ Injection marker confirmed" || \
+            echo "WARNING: BANNER INJECTION comment not found"
+
+          # Rebuild image with the patched file overlay included
+          echo "Rebuilding image with patched luci.js..."
+          make target/install -j$(nproc) 2>&1 | tail -3
+          make package/index 2>&1 | tail -3
+          echo "✓ Rebuild with patched luci.js complete"
 
       - name: List build output
         if: always()
@@ -239,6 +287,7 @@ jobs:
           fi
 
       - name: Create GitHub Release and upload firmware
+        if: always()
         run: |
           TAG="${{ github.event.inputs.xwrt_tag }}"
           BIN=$(find xwrt-source/bin/targets/ramips/mt7621 -name "*sysupgrade.bin" | head -n1)
