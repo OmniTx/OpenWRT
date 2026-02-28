@@ -69,6 +69,7 @@ jobs:
             exit 1
           }
           tar -Jxf "${TARBALL}"
+          rm "${TARBALL}"
           mv openwrt-imagebuilder-* imagebuilder
           echo "✓ ImageBuilder ready"
 
@@ -289,10 +290,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload firmware as artifact (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-xiaomi-4a-${{ steps.openwrt_version.outputs.version }}
           path: imagebuilder/bin/targets/ramips/mt7621/*sysupgrade.bin
+          if-no-files-found: warn
 
       - name: Upload build log as artifact
         if: always()
