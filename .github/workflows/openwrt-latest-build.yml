@@ -245,27 +245,26 @@ jobs:
 
           echo "✓ dns2socks compiled: $DNS2SOCKS_IPK"
           cp "$DNS2SOCKS_IPK" "$GITHUB_WORKSPACE/imagebuilder/packages/"
-          echo "✓ Copied to imagebuilder/packages/"
-
           # Regenerate the local packages index so opkg can discover dns2socks
           cd "$GITHUB_WORKSPACE/imagebuilder"
-          if [ -f scripts/ipkg-make-index.sh ]; then
-            cd packages
-            bash ../scripts/ipkg-make-index.sh . > Packages
-            gzip -kf Packages
-            echo "✓ Local Packages index regenerated"
-          else
-            # Fallback: use usign-less package index generation
+          echo "Building package index using ImageBuilder..."
+          make package_index || {
+            echo "WARNING: make package_index failed. Generating minimal Packages index manually..."
             cd packages
             for ipk in *.ipk; do
               [ -f "$ipk" ] || continue
-              echo "Package: $(echo $ipk | sed 's/_.*//') "
-              echo "Filename: $ipk"
-              echo ""
-            done >> Packages
+              # Support both gz and zst compressions used by OpenWrt
+              tar -xO -f "$ipk" ./control.tar.gz 2>/dev/null | tar -xzO ./control > control.tmp 2>/dev/null || \
+              tar -xO -f "$ipk" ./control.tar.zst 2>/dev/null | tar -xO --zstd ./control > control.tmp 2>/dev/null || true
+              cat control.tmp >> Packages 2>/dev/null || echo "Package: $(echo "$ipk" | sed 's/_.*//')" >> Packages
+              echo "Filename: $ipk" >> Packages
+              echo "Size: $(stat -c %s "$ipk")" >> Packages
+              echo "SHA256sum: $(sha256sum "$ipk" | awk '{print $1}')" >> Packages
+              echo "" >> Packages
+              rm -f control.tmp
+            done
             gzip -kf Packages
-            echo "✓ Local Packages index regenerated (fallback)"
-          fi
+          }
           ls -la "$GITHUB_WORKSPACE/imagebuilder/packages/"
           cd "$GITHUB_WORKSPACE"
 
