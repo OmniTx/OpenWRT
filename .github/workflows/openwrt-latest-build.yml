@@ -331,17 +331,24 @@ jobs:
       - name: Configure ImageBuilder package feeds
         run: |
           cd imagebuilder
-          # Ensure all official package feeds are enabled (uncomment if commented)
-          sed -i 's/^# \(src\/gz openwrt_\)/\1/' repositories.conf
-          # Disable signature checking so local ipks (dns2socks) can be installed
-          sed -i 's/^option check_signature/# option check_signature/' repositories.conf
-          echo "✓ Package feeds configured"
-          echo "--- repositories.conf ---"
-          cat repositories.conf
-          echo "--- Local packages ---"
-          ls -la packages/
-          echo "--- Packages index content ---"
-          cat packages/Packages || echo "WARNING: No Packages index found"
+          if [ -f "repositories.conf" ]; then
+            # OPKG-based (OpenWrt <= 23.05)
+            # Ensure all official package feeds are enabled (uncomment if commented)
+            sed -i 's/^# \(src\/gz openwrt_\)/\1/' repositories.conf
+            # Disable signature checking so local ipks (dns2socks) can be installed
+            sed -i 's/^option check_signature/# option check_signature/' repositories.conf
+            echo "✓ Package feeds configured (OPKG)"
+            echo "--- repositories.conf ---"
+            cat repositories.conf
+            echo "--- Packages index content ---"
+            cat packages/Packages || echo "WARNING: No Packages index found"
+          else
+            # APK-based (OpenWrt >= 24.10)
+            echo "✓ OpenWrt >= 24.10 detected (APK instead of OPKG)."
+            echo "✓ Local packages are managed dynamically without repositories.conf."
+          fi
+          echo "--- Local packages list ---"
+          find packages/ -type f -ls
 
       - name: Build ROM
         run: |
