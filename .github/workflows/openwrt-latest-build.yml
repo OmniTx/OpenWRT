@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
-            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
+            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3 zstd
 
       - name: Resolve OpenWrt Version
         id: openwrt_version
@@ -51,13 +51,17 @@ jobs:
             fi
 
             # Pick the newest version that actually has an ImageBuilder available
+            # We scrape the directory listing instead of guessing the filename,
+            # because 23.05.x uses .tar.xz while 24.10.x+ uses .tar.zst
             LATEST=""
             for VER in $VERSIONS; do
-              IB_URL="https://downloads.openwrt.org/releases/${VER}/targets/ramips/mt7621/openwrt-imagebuilder-${VER}-ramips-mt7621.Linux-x86_64.tar.xz"
-              echo "Checking ${VER}... (${IB_URL})"
-              if wget --spider -q "$IB_URL" 2>/dev/null; then
+              DIR_URL="https://downloads.openwrt.org/releases/${VER}/targets/ramips/mt7621/"
+              echo "Checking ${VER}..."
+              IB_FILE=$(wget -qO- "$DIR_URL" \
+                | grep -oP 'openwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n1)
+              if [ -n "$IB_FILE" ]; then
                 LATEST="$VER"
-                echo "✓ ImageBuilder available for ${VER}"
+                echo "✓ ImageBuilder available for ${VER}: ${IB_FILE}"
                 break
               else
                 echo "  ✗ ImageBuilder not found for ${VER}, trying older..."
@@ -80,13 +84,28 @@ jobs:
         run: |
           VERSION="${{ steps.openwrt_version.outputs.version }}"
           BASE_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/ramips/mt7621"
-          TARBALL="openwrt-imagebuilder-${VERSION}-ramips-mt7621.Linux-x86_64.tar.xz"
 
+          # Discover the actual ImageBuilder filename (handles .tar.xz and .tar.zst)
+          TARBALL=$(wget -qO- "${BASE_URL}/" \
+            | grep -oP 'openwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          if [ -z "$TARBALL" ]; then
+            echo "ERROR: Could not find ImageBuilder tarball for version ${VERSION}"
+            exit 1
+          fi
+
+          echo "Downloading: ${TARBALL}"
           wget "${BASE_URL}/${TARBALL}" || {
             echo "ERROR: Could not fetch ImageBuilder for version ${VERSION}"
             exit 1
           }
-          tar -Jxf "${TARBALL}"
+
+          # Extract — auto-detect compression (works with both xz and zst)
+          case "$TARBALL" in
+            *.tar.zst) zstd -d "${TARBALL}" --stdout | tar -xf - ;;
+            *.tar.xz)  tar -Jxf "${TARBALL}" ;;
+            *)         tar -axf "${TARBALL}" ;;
+          esac
           rm "${TARBALL}"
           mv openwrt-imagebuilder-* imagebuilder
           echo "✓ ImageBuilder ready"
@@ -224,20 +243,28 @@ jobs:
         run: |
           VERSION="${{ steps.openwrt_version.outputs.version }}"
           SDK_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/ramips/mt7621"
-          SDK_TAR="openwrt-sdk-${VERSION}-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
-          echo "Downloading OpenWrt SDK..."
+          # Discover the actual SDK filename (handles .tar.xz and .tar.zst, any GCC version)
+          SDK_TAR=$(wget -qO- "${SDK_URL}/" \
+            | grep -oP 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          if [ -z "$SDK_TAR" ]; then
+            echo "ERROR: Could not find SDK tarball for ${VERSION}"
+            exit 1
+          fi
+
+          echo "Downloading OpenWrt SDK: ${SDK_TAR}"
           wget -q "${SDK_URL}/${SDK_TAR}" || {
-            # Try alternate naming pattern
-            SDK_TAR=$(wget -qO- "${SDK_URL}/" \
-              | grep -oP 'openwrt-sdk-[^"]+\.tar\.xz' | head -n1)
-            wget -q "${SDK_URL}/${SDK_TAR}" || {
-              echo "ERROR: Could not download SDK for ${VERSION}"
-              exit 1
-            }
+            echo "ERROR: Could not download SDK for ${VERSION}"
+            exit 1
           }
 
-          tar -Jxf "${SDK_TAR}"
+          # Extract — auto-detect compression (works with both xz and zst)
+          case "$SDK_TAR" in
+            *.tar.zst) zstd -d "${SDK_TAR}" --stdout | tar -xf - ;;
+            *.tar.xz)  tar -Jxf "${SDK_TAR}" ;;
+            *)         tar -axf "${SDK_TAR}" ;;
+          esac
           rm "${SDK_TAR}"
           mv openwrt-sdk-* sdk
 
