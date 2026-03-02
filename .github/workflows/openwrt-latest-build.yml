@@ -40,18 +40,36 @@ jobs:
           # If triggered by schedule, INPUT_VERSION will be empty, so we default to "latest" safely
           if [ -z "$INPUT_VERSION" ] || [ "$INPUT_VERSION" = "latest" ]; then
             echo "Detecting latest stable OpenWrt version..."
-            LATEST=$(wget -qO- https://downloads.openwrt.org/releases/ \
+            # Get all stable version numbers, sorted newest-first
+            VERSIONS=$(wget -qO- https://downloads.openwrt.org/releases/ \
               | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(?=/)' \
-              | grep -v 'rc\|beta\|SNAPSHOT' \
-              | sort -V \
-              | tail -n1)
+              | sort -Vru)
 
-            if [ -z "$LATEST" ]; then
-              echo "ERROR: Could not detect latest OpenWrt stable version"
+            if [ -z "$VERSIONS" ]; then
+              echo "ERROR: Could not detect any OpenWrt stable versions"
               exit 1
             fi
 
-            echo "Latest stable OpenWrt: ${LATEST}"
+            # Pick the newest version that actually has an ImageBuilder available
+            LATEST=""
+            for VER in $VERSIONS; do
+              IB_URL="https://downloads.openwrt.org/releases/${VER}/targets/ramips/mt7621/openwrt-imagebuilder-${VER}-ramips-mt7621.Linux-x86_64.tar.xz"
+              echo "Checking ${VER}... (${IB_URL})"
+              if wget --spider -q "$IB_URL" 2>/dev/null; then
+                LATEST="$VER"
+                echo "✓ ImageBuilder available for ${VER}"
+                break
+              else
+                echo "  ✗ ImageBuilder not found for ${VER}, trying older..."
+              fi
+            done
+
+            if [ -z "$LATEST" ]; then
+              echo "ERROR: No OpenWrt stable version has an available ImageBuilder"
+              exit 1
+            fi
+
+            echo "Latest stable OpenWrt (verified): ${LATEST}"
             echo "version=${LATEST}" >> $GITHUB_OUTPUT
           else
             echo "Using specified OpenWrt version: ${INPUT_VERSION}"
