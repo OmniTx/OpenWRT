@@ -39,10 +39,10 @@ jobs:
           
           # If triggered by schedule, INPUT_VERSION will be empty, so we default to "latest" safely
           if [ -z "$INPUT_VERSION" ] || [ "$INPUT_VERSION" = "latest" ]; then
-            echo "Detecting latest stable OpenWrt version..."
-            # Get all stable version numbers, sorted newest-first
+            echo "Detecting latest OpenWrt version (including RC)..."
+            # Get all version numbers (stable + RC), sorted newest-first
             VERSIONS=$(wget -qO- https://downloads.openwrt.org/releases/ \
-              | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(?=/)' \
+              | grep -oP '(?<=href=")[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?(?=/)' \
               | sort -Vru)
 
             if [ -z "$VERSIONS" ]; then
