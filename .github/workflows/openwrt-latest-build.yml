@@ -288,23 +288,23 @@ jobs:
           echo "Compiling luci-app-zerotier..."
           make package/luci-app-zerotier/compile V=s -j$(nproc) 2>&1 | tail -20
 
-          # Find and copy the built ipks into ImageBuilder's packages dir
-          DNS2SOCKS_IPK=$(find bin/ -name "dns2socks*.ipk" | head -n1)
-          ZEROTIER_IPK=$(find bin/ -name "luci-app-zerotier*.ipk" | head -n1)
+          # Find and copy the built packages into ImageBuilder's packages dir
+          DNS2SOCKS_PKG=$(find bin/ -type f \( -name "dns2socks*.ipk" -o -name "dns2socks*.apk" \) | head -n1)
+          ZEROTIER_PKG=$(find bin/ -type f \( -name "luci-app-zerotier*.ipk" -o -name "luci-app-zerotier*.apk" \) | head -n1)
 
-          if [ -z "$DNS2SOCKS_IPK" ]; then
-            echo "ERROR: dns2socks ipk not found after SDK build"
+          if [ -z "$DNS2SOCKS_PKG" ]; then
+            echo "ERROR: dns2socks package not found after SDK build"
             exit 1
           fi
-          if [ -z "$ZEROTIER_IPK" ]; then
-            echo "ERROR: luci-app-zerotier ipk not found after SDK build"
+          if [ -z "$ZEROTIER_PKG" ]; then
+            echo "ERROR: luci-app-zerotier package not found after SDK build"
             exit 1
           fi
 
-          echo "✓ dns2socks compiled: $DNS2SOCKS_IPK"
-          echo "✓ luci-app-zerotier compiled: $ZEROTIER_IPK"
-          cp "$DNS2SOCKS_IPK" "$GITHUB_WORKSPACE/imagebuilder/packages/"
-          cp "$ZEROTIER_IPK" "$GITHUB_WORKSPACE/imagebuilder/packages/"
+          echo "✓ dns2socks compiled: $DNS2SOCKS_PKG"
+          echo "✓ luci-app-zerotier compiled: $ZEROTIER_PKG"
+          cp "$DNS2SOCKS_PKG" "$GITHUB_WORKSPACE/imagebuilder/packages/"
+          cp "$ZEROTIER_PKG" "$GITHUB_WORKSPACE/imagebuilder/packages/"
           # Regenerate the local packages index so opkg can discover dns2socks
           cd "$GITHUB_WORKSPACE/imagebuilder"
           echo "Building package index using ImageBuilder..."
